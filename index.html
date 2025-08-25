@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Metro Schedule</title>
+<style>
+  :root{
+    --bg: rgba(15,15,20,.45);
+    --deep: rgba(15,15,20,.65);
+    --stroke: rgba(255,110,50,.25);
+    --accent: #ff6e32;
+    --mut: rgba(255,255,255,.7);
+    --txt: #fff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:transparent;color:var(--txt);font:500 14px/1.4 Inter,system-ui,Segoe UI,Roboto,Arial}
+  .panel{position:absolute;top:8%;left:50%;transform:translateX(-50%);width:min(780px,92vw);
+    background:var(--bg);border:1px solid var(--stroke);border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
+  h1{margin:0;font-size:16px;letter-spacing:.3px}
+  .mut{color:var(--mut)}
+  .btn{padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--txt);cursor:pointer;transition:.15s}
+  .btn:hover{transform:translateY(-1px);border-color:var(--accent)}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),#ff8a4a);border:none;color:#111;font-weight:800}
+  .grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;align-items:center}
+  .head{padding:10px 14px;background:rgba(255,255,255,.04);border-bottom:1px solid rgba(255,255,255,.06);font-weight:700}
+  .row{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1)}
+  .nearest{border-left:3px solid var(--accent);background:var(--deep)}
+  .foot{display:flex;justify-content:space-between;align-items:center;padding:10px 14px}
+  .tiny{font-size:12px}
+  .status-ok{color:#19c37d;font-weight:700}
+  .status-miss{color:#d9534f;font-weight:700}
+</style>
+</head>
+<body>
+  <div class="panel" id="panel" style="display:none">
+    <header>
+      <h1>Metro Departures <span class="mut tiny" id="subtitle"></span></h1>
+      <div>
+        <button class="btn" id="focusNearest">Nearest Station</button>
+        <button class="btn" id="closeBtn">Close</button>
+      </div>
+    </header>
+
+    <div class="grid head">
+      <div>Station</div>
+      <div>Next →</div>
+      <div>Next ←</div>
+      <div></div>
+    </div>
+    <div id="list"></div>
+
+    <div class="foot">
+      <div class="tiny mut" id="footnote">Headway —</div>
+      <button class="btn primary" id="setNearest">Set Waypoint: Nearest</button>
+    </div>
+  </div>
+
+<script>
+  const RES = (typeof GetParentResourceName === 'function') ? GetParentResourceName() : null;
+  function nui(path, payload={}) {
+    if(!RES) return Promise.resolve();
+    return fetch(`https://${RES}/${path}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+  }
+
+  let DATA = null;
+  let startTs = 0;
+
+  function fmt(sec){
+    sec = Math.max(0, Math.floor(sec));
+    const m = Math.floor(sec/60), s = sec%60;
+    return (m>0? m+'m ':'') + s+'s';
+  }
+
+  function render(){
+    if(!DATA) return;
+    const list = document.getElementById('list');
+    list.innerHTML = '';
+    const elapsed = (Date.now() - startTs)/1000;
+
+    DATA.stations.forEach((st, idx) => {
+      const fwd = st.fwd - elapsed;
+      const back = st.back - elapsed;
+      const present = (DATA.presence && DATA.presence[idx]) || st.present || false;
+
+      const row = document.createElement('div');
+      row.className = 'grid row' + (idx+1===DATA.nearest?' nearest':'');
+      row.innerHTML = `
+        <div><span class="badge">${st.name}</span> <span class="mut tiny">to ${st.toNext}</span></div>
+        <div>${present ? `<span class="status-ok">${fmt(fwd)}</span>` : `<span class="status-miss">NO TRAIN</span>`}</div>
+        <div>${present ? `<span class="status-ok">${fmt(back)}</span>` : `<span class="status-miss">NO TRAIN</span>`}</div>
+        <div><button class="btn">Set Waypoint</button></div>`;
+      row.querySelector('button').onclick = () => nui('setWaypoint',{x:st.x,y:st.y});
+      list.appendChild(row);
+    });
+
+    document.getElementById('footnote').textContent = `Headway ≈ ${DATA.headway}s • Dwell ≈ ${DATA.dwell}s`;
+  }
+
+  // continuous repaint
+  function tick(){ render(); requestAnimationFrame(tick); }
+
+  // NUI messages from client.lua
+  window.addEventListener('message', (e) => {
+    const d = e.data||{};
+    switch(d.action){
+      case 'open':
+        DATA = d;
+        startTs = Date.now();
+        document.getElementById('panel').style.display = 'block';
+        render(); requestAnimationFrame(tick);
+        break;
+      case 'presence':
+        if(DATA && Array.isArray(d.present)){
+          DATA.presence = d.present;
+          render();
+        }
+        break;
+      case 'close':
+        document.getElementById('panel').style.display = 'none';
+        break;
+    }
+  });
+
+  // Controls
+  document.getElementById('closeBtn').onclick = () => { document.getElementById('panel').style.display='none'; nui('close',{}) }
+  document.getElementById('setNearest').onclick = () => {
+    if(!DATA) return;
+    const st=DATA.stations[DATA.nearest-1]; if(st) nui('setWaypoint',{x:st.x,y:st.y})
+  }
+  document.getElementById('focusNearest').onclick = () => {
+    const rows=[...document.querySelectorAll('#list .row')];
+    const r=rows[(DATA?.nearest||1)-1]; if(r) r.scrollIntoView({behavior:'smooth',block:'center'})
+  }
+
+  document.addEventListener('keydown',(e)=>{ if(e.key==='Escape'){ document.getElementById('panel').style.display='none'; nui('close',{}) } });
+</script>
+</body>
+</html>
