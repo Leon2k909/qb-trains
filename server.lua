@@ -1,48 +1,6 @@
 -- qb-trains — server.lua
 local QBCore = exports['qb-core']:GetCoreObject()
 
--- =====================
--- Simple schedule model
--- =====================
-local Sched = {}
-
-local function now() return os.time() end
-
-local function initSchedules()
-    local t = now()
-    Sched = {}
-    for i=1,#Config.Stations do
-        Sched[i] = {
-            fwd  = t + math.random(5, Config.Headway),
-            back = t + math.random(5, Config.Headway) + 15
-        }
-    end
-    print(('[qb-trains] schedules initialized for %d stations'):format(#Config.Stations))
-end
-
-AddEventHandler('onResourceStart', function(res)
-    if res ~= GetCurrentResourceName() then return end
-    initSchedules()
-end)
-
-CreateThread(function()
-    while true do
-        local t = now()
-        for i=1,#Config.Stations do
-            if t >= Sched[i].fwd  then Sched[i].fwd  = t + Config.Headway end
-            if t >= Sched[i].back then Sched[i].back = t + Config.Headway end
-        end
-        Wait(1000)
-    end
-end)
-
--- =====================
--- Callbacks
--- =====================
-QBCore.Functions.CreateCallback('qb-trains:schedule', function(src, cb)
-    cb(Sched, now())
-end)
-
 -- Charge EXACTLY $1000 from BANK when doors close
 QBCore.Functions.CreateCallback('qb-trains:charge', function(src, cb, stationName)
     local Player = QBCore.Functions.GetPlayer(src)
@@ -61,14 +19,6 @@ QBCore.Functions.CreateCallback('qb-trains:charge', function(src, cb, stationNam
         cb(false, fare)
     end
 end)
-
--- =====================
--- Admin
--- =====================
-QBCore.Commands.Add('trainreset', 'Reset train schedules', {}, false, function(source)
-    initSchedules()
-    TriggerClientEvent('QBCore:Notify', source, 'Train schedules reset', 'success')
-end, 'admin')
 
 -- quick diagnostic command: test charge now
 QBCore.Commands.Add('traintestcharge', 'Test metro charge ($1000 bank)', {}, false, function(source)
