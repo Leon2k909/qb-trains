@@ -36,7 +36,7 @@ end)
 -- State / helpers
 -- =========================
 local boarding, inTransit = false, false
-local schedCache, schedNow, lastFetch = nil, 0, 0
+local hasTicket = false
 local uiOpen = false
 local spawnedTrains = {} -- station index -> entity id
 
@@ -57,18 +57,30 @@ local function isTrain(ent)
     return DoesEntityExist(ent) and IsThisModelATrain(GetEntityModel(ent))
 end
 
+local function getTrainEntities()
+    local trains, seen = {}, {}
+    for _, poolName in ipairs({'CTrain', 'CVehicle'}) do
+        local pool = GetGamePool and GetGamePool(poolName) or {}
+        for _, ent in ipairs(pool) do
+            if not seen[ent] and isTrain(ent) then
+                seen[ent] = true
+                trains[#trains+1] = ent
+            end
+        end
+    end
+    return trains
+end
+
 -- stopped train near a position
 local function getStoppedTrainNear(pos)
     local radius = Config.TrainDetectRadius or 7.5
     local limit  = Config.TrainBoardSpeedKmh or 3.0
-    for _, v in ipairs(GetGamePool('CVehicle')) do
-        if isTrain(v) then
-            local d = #(GetEntityCoords(v) - pos)
-            if d < radius then
-                local kmh = GetEntitySpeed(v) * 3.6
-                if kmh <= limit or IsEntityPositionFrozen(v) then
-                    return v
-                end
+    for _, v in ipairs(getTrainEntities()) do
+        local d = #(GetEntityCoords(v) - pos)
+        if d < radius then
+            local kmh = GetEntitySpeed(v) * 3.6
+            if kmh <= limit or IsEntityPositionFrozen(v) then
+                return v
             end
         end
     end
@@ -134,15 +146,6 @@ end)
 -- =========================
 -- Server RPC helpers
 -- =========================
-local function lib_Schedule()
-    local result = nil
-    QBCore.Functions.TriggerCallback('qb-trains:schedule', function(sched, t)
-        result = {sched = sched, t = t}
-    end)
-    while result == nil do Wait(0) end
-    return result.sched, result.t
-end
-
 -- server charges $1000 from BANK
 local function lib_Charge(stationName)
     local ok, fare = nil, nil
@@ -153,17 +156,39 @@ local function lib_Charge(stationName)
     return ok, fare
 end
 
-local function getScheduleCached()
-    local t = GetGameTimer()
-    if not schedCache or (t - lastFetch) > (Config.RefreshScheduleMs or 1500) then
-        local got = false
-        QBCore.Functions.TriggerCallback('qb-trains:schedule', function(s, n)
-            schedCache = s; schedNow = n; got = true
-        end)
-        while not got do Wait(0) end
-        lastFetch = t
+-- build a schedule based on actual train entities
+local function buildLiveSchedule()
+    local n = #Config.Stations
+    local timesFwd, timesBack = {}, {}
+    for i=1,n do timesFwd[i]=9999; timesBack[i]=9999 end
+    for _, v in ipairs(getTrainEntities()) do
+        local pos = GetEntityCoords(v)
+        local idx = nearestStationIndex(pos)
+        local nextPos = Config.Stations[wrapIndex(idx+1,n)].coords
+        local prevPos = Config.Stations[wrapIndex(idx-1,n)].coords
+        local vel = GetEntityVelocity(v)
+        local dotF = (nextPos.x-pos.x)*vel.x + (nextPos.y-pos.y)*vel.y + (nextPos.z-pos.z)*vel.z
+        local dotB = (prevPos.x-pos.x)*vel.x + (prevPos.y-pos.y)*vel.y + (prevPos.z-pos.z)*vel.z
+        local dirFwd = dotF >= dotB
+        local t = 0
+        local i = idx
+        repeat
+            if dirFwd then
+                if t < timesFwd[i] then timesFwd[i]=t end
+                t = t + (Config.DwellTime or 12) + (Config.SegmentTravelTime or 25)
+                i = wrapIndex(i+1, n)
+            else
+                if t < timesBack[i] then timesBack[i]=t end
+                t = t + (Config.DwellTime or 12) + (Config.SegmentTravelTime or 25)
+                i = wrapIndex(i-1, n)
+            end
+        until i == idx
     end
-    return schedCache, schedNow
+    local sched = {}
+    for i=1,n do
+        sched[i] = { fwd = timesFwd[i], back = timesBack[i] }
+    end
+    return sched
 end
 
 local function canBoardAtStation(idx)
@@ -171,10 +196,9 @@ local function canBoardAtStation(idx)
         if getStoppedTrainNear(Config.Stations[idx].coords) == 0 then return false end
     end
     if Config.AlwaysAllowBoard then return true end
-    local s, now = getScheduleCached()
-    if not s then return false end
-    local nextDepart = math.min(s[idx].fwd, s[idx].back)
-    local secs = math.max(0, nextDepart - now)
+    local s = buildLiveSchedule()
+    if not s or not s[idx] then return false end
+    local secs = math.min(s[idx].fwd, s[idx].back)
     return secs <= (Config.DwellTime or 12)
 end
 
@@ -195,12 +219,38 @@ function startBoarding(stIndex)
     local ok, fare = lib_Charge(Config.Stations[stIndex].name)
     if ok then
         QBCore.Functions.Notify(('Fare deducted: $%d'):format(fare or 1000), 'success', 2500)
-        -- No fade/teleport. Player walks on.
+        hasTicket = true
+        local train = getStoppedTrainNear(Config.Stations[stIndex].coords)
+        if train ~= 0 then
+            TaskEnterVehicle(ped, train, -1, 0, 2.0, 1, 0)
+        end
     else
         QBCore.Functions.Notify('Insufficient bank balance ($1000 required)', 'error')
+        hasTicket = false
     end
     SetTimeout(400, function() boarding = false end)
 end
+
+-- kick players who didn't pay
+CreateThread(function()
+    while true do
+        Wait(1000)
+        local ped = PlayerPedId()
+        if IsPedInAnyVehicle(ped, false) then
+            local veh = GetVehiclePedIsIn(ped, false)
+            if isTrain(veh) then
+                if not hasTicket then
+                    TaskLeaveVehicle(ped, veh, 16)
+                    QBCore.Functions.Notify('You need to pay the fare to ride', 'error')
+                end
+            else
+                hasTicket = false
+            end
+        else
+            hasTicket = false
+        end
+    end
+end)
 
 -- =========================
 -- Station marker + E prompt
@@ -211,7 +261,7 @@ CreateThread(function()
         if not inTransit and not boarding then
             local ped = PlayerPedId()
             local p = GetEntityCoords(ped)
-            getScheduleCached()
+            local sched = buildLiveSchedule()
             for idx, st in ipairs(Config.Stations) do
                 if #(p - st.coords) < ((Config.MarkerRadius or 2.5) + 0.6) then
                     sleep = 0
@@ -226,11 +276,9 @@ CreateThread(function()
                             local msg = ('%s — no train present'):format(st.name)
                             if Config.HelpText then Config.HelpText(msg) else DrawTxtCenter(0.5,0.90,msg) end
                         else
-                            local s, now = schedCache, schedNow
-                            if s then
-                                local nextDepart = math.min(s[idx].fwd, s[idx].back)
-                                local secs = math.max(0, nextDepart - now)
-                                local msg = ('%s — arrives in %ds'):format(st.name, secs)
+                            if sched and sched[idx] then
+                                local secs = math.min(sched[idx].fwd, sched[idx].back)
+                                local msg = ('%s — arrives in %ds'):format(st.name, math.floor(secs))
                                 if Config.HelpText then Config.HelpText(msg) else DrawTxtCenter(0.5,0.90,msg) end
                             end
                         end
@@ -255,8 +303,8 @@ CreateThread(function()
     while true do
         local ped = PlayerPedId()
         local p = GetEntityCoords(ped)
-        for _, v in ipairs(GetGamePool('CVehicle')) do
-            if not added[v] and isTrain(v) and #(GetEntityCoords(v) - p) < 60.0 then
+        for _, v in ipairs(getTrainEntities()) do
+            if not added[v] and #(GetEntityCoords(v) - p) < 60.0 then
                 exports['qb-target']:AddTargetEntity(v, {
                     options = {
                         {
@@ -318,11 +366,6 @@ RegisterNetEvent('QBCore:Client:OnPlayerLoaded', buildTrainBlips)
 RegisterNetEvent('QBCore:Client:OnPlayerUnload', clearTrainBlips)
 RegisterCommand('trainblips', function() buildTrainBlips() end, false)
 
--- =========================
--- /trains NUI (presence-aware)
--- =========================
-local function nextTime(secs, headway) while secs < 0 do secs = secs + headway end return secs end
-
 local function sendPresenceTick()
     while uiOpen do
         local pres = {}
@@ -335,7 +378,7 @@ local function sendPresenceTick()
 end
 
 local function openTrainsUI()
-    local sched, tnow = lib_Schedule()
+    local sched = buildLiveSchedule()
     if not sched then QBCore.Functions.Notify('Schedule unavailable', 'error') return end
 
     local ped = PlayerPedId()
@@ -346,8 +389,8 @@ local function openTrainsUI()
     for i, st in ipairs(Config.Stations) do
         local d = #(p - st.coords)
         if d < nearestDist then nearestDist = d nearestIdx = i end
-        local fwd = nextTime(sched[i].fwd - tnow, Config.Headway)
-        local back = nextTime(sched[i].back - tnow, Config.Headway)
+        local fwd = sched[i] and sched[i].fwd or 0
+        local back = sched[i] and sched[i].back or 0
         rows[#rows+1] = {
             i=i, name=st.name,
             x=st.coords.x, y=st.coords.y, z=st.coords.z,
