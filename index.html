@@ -90,8 +90,8 @@
       row.className = 'grid row' + (idx+1===DATA.nearest?' nearest':'');
       row.innerHTML = `
         <div><span class="badge">${st.name}</span> <span class="mut tiny">to ${st.toNext}</span></div>
-        <div>${present ? `<span class="status-ok">${fmt(fwd)}</span>` : `<span class="status-miss">NO TRAIN</span>`}</div>
-        <div>${present ? `<span class="status-ok">${fmt(back)}</span>` : `<span class="status-miss">NO TRAIN</span>`}</div>
+        <div><span class="${present ? 'status-ok' : 'status-miss'}">${fmt(fwd)}</span></div>
+        <div><span class="${present ? 'status-ok' : 'status-miss'}">${fmt(back)}</span></div>
         <div><button class="btn">Set Waypoint</button></div>`;
       row.querySelector('button').onclick = () => nui('setWaypoint',{x:st.x,y:st.y});
       list.appendChild(row);
